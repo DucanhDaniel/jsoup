@@ -10,7 +10,6 @@ import org.jsoup.nodes.Node;
 import org.jsoup.nodes.TextNode;
 import org.jspecify.annotations.Nullable;
 
-import java.util.LinkedList;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
