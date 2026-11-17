@@ -183,7 +183,7 @@ public final class StringUtil {
         int l = string.length();
         for (int i = 0; i < l; i++) {
             char c = string.charAt(i);
-            if (!isDigit(c) && c != '.') // also accept decimal numbers
+            if (!isDigit(c))
                 return false;
         }
         return true;
