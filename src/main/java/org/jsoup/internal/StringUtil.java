@@ -152,7 +152,7 @@ public final class StringUtil {
         if (string == null || string.isEmpty())
             return true;
 
-        int l = string.length();
+        int len = string.length();
         for (int i = 0; i < l; i++) {
             if (!StringUtil.isWhitespace(string.codePointAt(i)))
                 return false;
