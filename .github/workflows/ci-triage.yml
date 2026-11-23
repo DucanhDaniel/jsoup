@@ -2,6 +2,9 @@ name: CI triage
 # Bot phân tích lỗi CI (bước 1: chỉ bình luận). Chạy khi workflow Build của một pull request bị lỗi:
 # phân loại lỗi bằng mô hình (CPU), Claude Code đọc code để tìm nguyên nhân (chỉ đọc), chọn người xử lý theo quy tắc,
 # rồi bình luận vào pull request. Cần secret CLAUDE_CODE_OAUTH_TOKEN (claude setup-token) và KAGGLE_API_TOKEN.
+# 24/11: bản sửa của agent qua chốt phạm vi; nếu còn thay đổi ngoài file test thì job `verify` (KHÔNG có secret,
+# permissions rỗng, code của PR chỉ chạy trong container) áp bản sửa và chạy lại đúng bước CI lỗi; job `report` điền
+# kết quả vào bình luận. Code của PR không bao giờ chạy trong job có secret.
 on:
   workflow_run:
     workflows: [Build]
@@ -15,6 +18,8 @@ permissions:
 
 jobs:
   triage:
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
     if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -35,7 +40,7 @@ jobs:
       - name: Install
         run: |
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -q transformers numpy pandas pyarrow duckdb requests kaggle six
+          pip install -q transformers numpy pandas pyarrow duckdb requests kaggle six pyyaml
           npm install -g @anthropic-ai/claude-code
       - name: Download model and code (private Kaggle datasets)
         env:
@@ -60,4 +65,121 @@ jobs:
           python -m project3.demo.bot --repo "${{ github.repository }}" --run-id "${{ github.event.workflow_run.id }}" \
             ${PR:+--pr "$PR"} --bundle "$HOME/p3/p3-demo" \
             --weights "$HOME/p3/p3-c-weights/C_s0_fold{fold}.model_soft0.pt" \
-            --cause-weights "$HOME/p3/p3-cause-weights/CAUSED_s0_fold{fold}.model_soft0.pt"
+            --cause-weights "$HOME/p3/p3-cause-weights/CAUSED_s0_fold{fold}.model_soft0.pt" \
+            --verify-out "$RUNNER_TEMP/plan.json"
+      - id: plan
+        if: always()
+        run: echo "plan=$([ -f "$RUNNER_TEMP/plan.json" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.plan == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-plan
+          path: ${{ runner.temp }}/plan.json
+
+  verify:
+    # Chạy thử bản sửa: không secret, GITHUB_TOKEN không quyền gì. Code của PR (lệnh build, test, plugin) chỉ chạy
+    # trong container Docker không đặc quyền, không nhận biến môi trường của runner.
+    needs: triage
+    if: needs.triage.outputs.plan == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verify-plan
+          path: plan
+      - name: Checkout failing commit and apply fix (no code of the PR is executed here)
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, pathlib
+          p = json.load(open("plan/plan.json"))
+          w = pathlib.Path("w"); w.mkdir()
+          g = lambda *a: subprocess.run(["git", "-C", "w", *a], check=True)
+          g("init", "-q"); g("fetch", "-q", "--depth", "1", f"https://github.com/{p['repo']}", p["sha"]); g("checkout", "-q", "FETCH_HEAD")
+          for e in p["edits"]:
+              f = w / e["path"]; t = f.read_text(encoding="utf-8")
+              assert t.count(e["old_text"]) == 1, e["path"]
+              f.write_text(t.replace(e["old_text"], e["new_text"]), encoding="utf-8")
+          pathlib.Path("cmd.sh").write_text("set -e\n" + p["cmd"] + "\n")
+          pathlib.Path("java").write_text(p["java"])
+          PY
+          git -C w diff --stat
+      - name: Re-run the failed CI step with the fix (inside container)
+        run: |
+          start=$(date +%s)
+          set +e
+          timeout 20m docker run --rm -v "$PWD/w:/w" -v "$PWD/cmd.sh:/cmd.sh:ro" -w /w \
+            "maven:3.9-eclipse-temurin-$(cat java)" bash /cmd.sh > out.log 2>&1
+          code=$?
+          set -e
+          python3 - "$code" "$(( $(date +%s) - start ))" <<'PY'
+          import json, re, sys
+          lines = open("out.log", encoding="utf-8", errors="replace").read().splitlines()
+          key = [l for l in lines if re.search(r"ERROR|FAIL|Tests run:|BUILD (SUCCESS|FAILURE)", l)]
+          json.dump({"exit": int(sys.argv[1]), "seconds": int(sys.argv[2]), "key": key[-40:], "tail": lines[-15:]},
+                    open("result.json", "w"))
+          PY
+          tail -30 out.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-result
+          path: result.json
+
+  report:
+    needs: [triage, verify]
+    if: always() && needs.triage.outputs.plan == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: verify-plan
+          path: plan
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: verify-result
+          path: res
+      - name: Write result into the bot comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          def api(m, path, body=None):
+              r = urllib.request.Request("https://api.github.com" + path, method=m,
+                  data=json.dumps(body).encode() if body else None,
+                  headers={"Authorization": "Bearer " + os.environ["GITHUB_TOKEN"], "Accept": "application/vnd.github+json"})
+              return json.load(urllib.request.urlopen(r))
+          clean = lambda s: s.replace("```", "'''").replace("<!--", "<!_-")[:300]
+          plan = json.load(open("plan/plan.json")) if os.path.exists("plan/plan.json") else {}
+          step = plan.get("step", "?")
+          if os.path.exists("res/result.json"):
+              r = json.load(open("res/result.json"))
+              head = (f"✅ Bản sửa **chạy qua** bước `{step}`" if r["exit"] == 0 else
+                      f"❌ Bản sửa **chưa qua** bước `{step}` (mã thoát {r['exit']})")
+              lines = "\n".join(clean(l) for l in (r["key"] or r["tail"]))
+              text = (f"{head} · {r['seconds']} giây · test giữ nguyên bản gốc, chạy trên máy riêng không có secret "
+                      f"([log]({os.environ['RUN_URL']}))\n\n<details><summary>Dòng chính của log chạy thử</summary>"
+                      f"\n\n```\n{lines}\n```\n</details>")
+          else:
+              text = f"⚠️ Không chạy thử được ([log]({os.environ['RUN_URL']}))."
+          if plan.get("skipped_test_edits"):
+              text += f"\n\n_{plan['skipped_test_edits']} thay đổi trong file test không được áp khi chạy thử._"
+          pr, repo, mark = os.environ["PR"], os.environ["REPO"], "<!-- p3-verify -->"
+          cs = [c for c in api("GET", f"/repos/{repo}/issues/{pr}/comments?per_page=100") if mark in (c["body"] or "")]
+          if cs:
+              b = cs[-1]["body"]
+              b = re.sub(re.escape(mark) + ".*?" + re.escape(mark), lambda _: mark + "\n" + text + "\n" + mark, b, flags=re.S)
+              api("PATCH", f"/repos/{repo}/issues/comments/{cs[-1]['id']}", {"body": b})
+              print("đã điền kết quả")
+          PY
