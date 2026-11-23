@@ -116,7 +116,9 @@ jobs:
           python3 - "$code" "$(( $(date +%s) - start ))" <<'PY'
           import json, re, sys
           lines = open("out.log", encoding="utf-8", errors="replace").read().splitlines()
-          key = [l for l in lines if re.search(r"ERROR|FAIL|Tests run:|BUILD (SUCCESS|FAILURE)", l)]
+          # dòng lỗi + dòng tổng kết (bỏ "Tests run ... -- in <lớp>" của từng lớp test khi lớp đó không lỗi)
+          key = [l for l in lines if re.search(r"ERROR|FAIL|BUILD (SUCCESS|FAILURE)", l)
+                 or ("Tests run:" in l and " -- in " not in l)]
           json.dump({"exit": int(sys.argv[1]), "seconds": int(sys.argv[2]), "key": key[-40:], "tail": lines[-15:]},
                     open("result.json", "w"))
           PY
