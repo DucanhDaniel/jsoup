@@ -172,17 +172,25 @@ public final class StringUtil {
     }
 
     /**
-     * Tests if a string is numeric, i.e. contains only ASCII digit characters
+     * Tests if a string is numeric, i.e. contains only ASCII digit characters, optionally with a single decimal point
+     * between digits (e.g. {@code "12.5"}). Decimal support was added intentionally so that numeric attribute values
+     * such as {@code width="12.5"} are recognised.
      * @param string string to test
-     * @return true if only digit chars, false if empty or null or contains non-digit chars
+     * @return true if only digit chars (with at most one inner decimal point), false if empty or null or contains other
+     * chars
      */
     public static boolean isNumeric(String string) {
         if (string == null || string.length() == 0)
             return false;
 
         int l = string.length();
+        boolean dot = false;
         for (int i = 0; i < l; i++) {
             char c = string.charAt(i);
+            if (c == '.' && !dot && i > 0 && i < l - 1) {
+                dot = true;
+                continue;
+            }
             if (!isDigit(c))
                 return false;
         }
