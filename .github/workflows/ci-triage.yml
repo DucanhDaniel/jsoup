@@ -82,47 +82,66 @@ jobs:
     needs: triage
     if: needs.triage.outputs.plan == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions: {}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: verify-plan
           path: plan
-      - name: Checkout failing commit and apply fix (no code of the PR is executed here)
+      - name: Prepare working copies (no code of the PR is executed here)
+        # A = commit lỗi + bản sửa code, test GỐC. Khi agent sửa test (25/11, fail-to-pass như SWE-bench):
+        # B = commit lỗi + mọi thay đổi (phải pass); C = code trước PR + file test đã sửa (phải fail).
         run: |
           python3 - <<'PY'
-          import json, subprocess, pathlib
+          import json, subprocess, pathlib, shutil
           p = json.load(open("plan/plan.json"))
-          w = pathlib.Path("w"); w.mkdir()
-          g = lambda *a: subprocess.run(["git", "-C", "w", *a], check=True)
-          g("init", "-q"); g("fetch", "-q", "--depth", "1", f"https://github.com/{p['repo']}", p["sha"]); g("checkout", "-q", "FETCH_HEAD")
-          for e in p["edits"]:
-              f = w / e["path"]; t = f.read_text(encoding="utf-8")
-              assert t.count(e["old_text"]) == 1, e["path"]
-              f.write_text(t.replace(e["old_text"], e["new_text"]), encoding="utf-8")
+          def checkout(name, sha):
+              d = pathlib.Path(name); d.mkdir()
+              g = lambda *a: subprocess.run(["git", "-C", name, *a], check=True)
+              g("init", "-q"); g("fetch", "-q", "--depth", "1", f"https://github.com/{p['repo']}", sha); g("checkout", "-q", "FETCH_HEAD")
+              return d
+          def apply(d, edits):
+              for e in edits:
+                  f = d / e["path"]; t = f.read_text(encoding="utf-8")
+                  assert t.count(e["old_text"]) == 1, e["path"]
+                  f.write_text(t.replace(e["old_text"], e["new_text"]), encoding="utf-8")
+          runs = []
+          if p["edits"]:
+              apply(checkout("wA", p["sha"]), p["edits"]); runs.append("A")
+          if p.get("test_edits"):
+              b = checkout("wB", p["sha"]); apply(b, p["edits"] + p["test_edits"]); runs.append("B")
+              if p.get("base_sha"):
+                  c = checkout("wC", p["base_sha"])
+                  for path in dict.fromkeys(e["path"] for e in p["test_edits"]):
+                      (c / path).parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(b / path, c / path)
+                  runs.append("C")
+          pathlib.Path("runs").write_text(" ".join(runs))
           pathlib.Path("cmd.sh").write_text("set -e\n" + p["cmd"] + "\n")
           pathlib.Path("java").write_text(p["java"])
           PY
-          git -C w diff --stat
-      - name: Re-run the failed CI step with the fix (inside container)
+          cat runs
+      - name: Re-run the failed CI step (inside container)
         run: |
-          start=$(date +%s)
-          set +e
-          timeout 20m docker run --rm -v "$PWD/w:/w" -v "$PWD/cmd.sh:/cmd.sh:ro" -w /w \
-            "maven:3.9-eclipse-temurin-$(cat java)" bash /cmd.sh > out.log 2>&1
-          code=$?
-          set -e
-          python3 - "$code" "$(( $(date +%s) - start ))" <<'PY'
-          import json, re, sys
-          lines = open("out.log", encoding="utf-8", errors="replace").read().splitlines()
+          for r in $(cat runs); do
+            start=$(date +%s)
+            set +e
+            timeout 12m docker run --rm -v "$PWD/w$r:/w" -v "$PWD/cmd.sh:/cmd.sh:ro" -w /w               "maven:3.9-eclipse-temurin-$(cat java)" bash /cmd.sh > "out$r.log" 2>&1
+            code=$?
+            set -e
+            python3 - "$r" "$code" "$(( $(date +%s) - start ))" <<'PY'
+          import json, os, re, sys
+          r, code, sec = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          lines = open(f"out{r}.log", encoding="utf-8", errors="replace").read().splitlines()
           # dòng lỗi + dòng tổng kết (bỏ "Tests run ... -- in <lớp>" của từng lớp test khi lớp đó không lỗi)
           key = [l for l in lines if re.search(r"ERROR|FAIL|BUILD (SUCCESS|FAILURE)", l)
                  or ("Tests run:" in l and " -- in " not in l)]
-          json.dump({"exit": int(sys.argv[1]), "seconds": int(sys.argv[2]), "key": key[-40:], "tail": lines[-15:]},
-                    open("result.json", "w"))
+          res = json.load(open("result.json")) if os.path.exists("result.json") else {}
+          res[r] = {"exit": code, "seconds": sec, "key": key[-40:], "tail": lines[-15:]}
+          json.dump(res, open("result.json", "w"))
           PY
-          tail -30 out.log
+            echo "== $r: exit $code"; tail -15 "out$r.log"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -165,18 +184,31 @@ jobs:
           clean = lambda s: s.replace("```", "'''").replace("<!--", "<!_-")[:300]
           plan = json.load(open("plan/plan.json")) if os.path.exists("plan/plan.json") else {}
           step = plan.get("step", "?")
-          if os.path.exists("res/result.json"):
-              r = json.load(open("res/result.json"))
-              head = (f"✅ Bản sửa **chạy qua** bước `{step}`" if r["exit"] == 0 else
-                      f"❌ Bản sửa **chưa qua** bước `{step}` (mã thoát {r['exit']})")
-              lines = "\n".join(clean(l) for l in (r["key"] or r["tail"]))
-              text = (f"{head} · {r['seconds']} giây · test giữ nguyên bản gốc, chạy trên máy riêng không có secret "
-                      f"([log]({os.environ['RUN_URL']}))\n\n<details><summary>Dòng chính của log chạy thử</summary>"
-                      f"\n\n```\n{lines}\n```\n</details>")
-          else:
-              text = f"⚠️ Không chạy thử được ([log]({os.environ['RUN_URL']}))."
-          if plan.get("skipped_test_edits"):
-              text += f"\n\n_{plan['skipped_test_edits']} thay đổi trong file test không được áp khi chạy thử._"
+          R = json.load(open("res/result.json")) if os.path.exists("res/result.json") else {}
+          log = lambda r, t: (f"<details><summary>{t}</summary>\n\n```\n"
+                              + "\n".join(clean(l) for l in (r["key"] or r["tail"])) + "\n```\n</details>")
+          parts = []
+          if "A" in R:
+              r = R["A"]
+              head = (f"✅ Bản sửa code **chạy qua** bước `{step}`" if r["exit"] == 0 else
+                      f"❌ Bản sửa code **chưa qua** bước `{step}` (mã thoát {r['exit']})")
+              parts.append(f"{head} · {r['seconds']} giây · test giữ nguyên bản gốc\n\n" + log(r, "Log chạy thử (test gốc)"))
+          if "B" in R:  # 25/11: fail-to-pass cho test đã sửa (SWE-bench / SWT-bench)
+              b, c = R["B"], R.get("C")
+              if b["exit"] != 0:
+                  v = "❌ Test đã sửa **vẫn fail** trên code của PR (+ bản sửa)."
+              elif c is None:
+                  v = "⚠️ Test đã sửa pass trên code của PR; không lấy được code trước PR để kiểm tra fail-to-pass."
+              elif c["exit"] != 0:
+                  v = ("✅ Test đã sửa đạt **fail-to-pass**: fail trên code trước PR, pass trên code của PR → test "
+                       "kiểm tra đúng hành vi mới. Người duyệt vẫn cần xác nhận hành vi mới là đúng ý.")
+              else:
+                  v = ("⚠️ Test đã sửa **pass cả trên code trước PR** → không còn phân biệt hành vi cũ / mới, "
+                       "có thể đã bị làm yếu. Không nên áp.")
+              parts.append(f"**Kiểm tra test đã sửa:** {v}\n\n" + log(b, "Log: code của PR + test đã sửa")
+                           + ("\n\n" + log(c, "Log: code trước PR + test đã sửa") if c else ""))
+          text = ("\n\n".join(parts) + f"\n\n<sub>Chạy trên máy riêng không có secret · [log]({os.environ['RUN_URL']})</sub>"
+                  if parts else f"⚠️ Không chạy thử được ([log]({os.environ['RUN_URL']})).")
           pr, repo, mark = os.environ["PR"], os.environ["REPO"], "<!-- p3-verify -->"
           cs = [c for c in api("GET", f"/repos/{repo}/issues/{pr}/comments?per_page=100") if mark in (c["body"] or "")]
           if cs:
