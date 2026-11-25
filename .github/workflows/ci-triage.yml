@@ -123,24 +123,45 @@ jobs:
           cat runs
       - name: Re-run the failed CI step (inside container)
         run: |
+          # Thư viện Maven dùng chung giữa các lượt (volume Docker m2, chỉ sống trong job này). Lỗi tải thư viện
+          # (vd Maven Central trả 429) = lỗi hạ tầng: thử lại tối đa 3 lần, không tính là test fail.
+          INFRA='status code: 429|Could not transfer artifact|Could not resolve dependencies|Unresolveable build extension|Connection reset|Connection timed out|Temporary failure in name resolution'
           for r in $(cat runs); do
-            start=$(date +%s)
-            set +e
-            timeout 12m docker run --rm -v "$PWD/w$r:/w" -v "$PWD/cmd.sh:/cmd.sh:ro" -w /w               "maven:3.9-eclipse-temurin-$(cat java)" bash /cmd.sh > "out$r.log" 2>&1
-            code=$?
-            set -e
-            python3 - "$r" "$code" "$(( $(date +%s) - start ))" <<'PY'
+            for attempt in 1 2 3; do
+              start=$(date +%s)
+              set +e
+              timeout 12m docker run --rm -v m2:/root/.m2 -v "$PWD/w$r:/w" -v "$PWD/cmd.sh:/cmd.sh:ro" -w /w \
+                "maven:3.9-eclipse-temurin-$(cat java)" bash /cmd.sh > "out$r.log" 2>&1
+              code=$?
+              set -e
+              if [ $code -eq 0 ] || ! grep -qE "$INFRA" "out$r.log"; then break; fi
+              echo "== $r: lỗi tải thư viện, thử lại lần $((attempt + 1))"; sleep $((attempt * 60))
+            done
+            python3 - "$r" "$code" "$(( $(date +%s) - start ))" "$INFRA" <<'PY'
           import json, os, re, sys
-          r, code, sec = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-          lines = open(f"out{r}.log", encoding="utf-8", errors="replace").read().splitlines()
+          r, code, sec, infra = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+          text = open(f"out{r}.log", encoding="utf-8", errors="replace").read()
+          lines = text.splitlines()
+          # pass / test_fail / compile_fail / infra / fail — C chỉ tính là "fail" khi test_fail hoặc compile_fail
+          if code == 0:
+              status = "pass"
+          elif re.search(r"Tests run: \d+, Failures: [1-9]|Tests run: \d+, Failures: \d+, Errors: [1-9]|There are test failures", text):
+              status = "test_fail"
+          elif "COMPILATION ERROR" in text:
+              status = "compile_fail"
+          elif re.search(infra, text):
+              status = "infra"
+          else:
+              status = "fail"
           # dòng lỗi + dòng tổng kết (bỏ "Tests run ... -- in <lớp>" của từng lớp test khi lớp đó không lỗi)
           key = [l for l in lines if re.search(r"ERROR|FAIL|BUILD (SUCCESS|FAILURE)", l)
                  or ("Tests run:" in l and " -- in " not in l)]
           res = json.load(open("result.json")) if os.path.exists("result.json") else {}
-          res[r] = {"exit": code, "seconds": sec, "key": key[-40:], "tail": lines[-15:]}
+          res[r] = {"exit": code, "status": status, "seconds": sec, "key": key[-40:], "tail": lines[-15:]}
           json.dump(res, open("result.json", "w"))
+          print(r, status)
           PY
-            echo "== $r: exit $code"; tail -15 "out$r.log"
+            tail -15 "out$r.log"
           done
       - uses: actions/upload-artifact@v4
         if: always()
@@ -188,18 +209,24 @@ jobs:
           log = lambda r, t: (f"<details><summary>{t}</summary>\n\n```\n"
                               + "\n".join(clean(l) for l in (r["key"] or r["tail"])) + "\n```\n</details>")
           parts = []
+          INFRA = "⚠️ Không chạy được do lỗi tải thư viện (hạ tầng, đã thử lại 3 lần) — chạy lại job sau."
           if "A" in R:
               r = R["A"]
-              head = (f"✅ Bản sửa code **chạy qua** bước `{step}`" if r["exit"] == 0 else
-                      f"❌ Bản sửa code **chưa qua** bước `{step}` (mã thoát {r['exit']})")
+              head = (f"✅ Bản sửa code **chạy qua** bước `{step}`" if r["status"] == "pass" else INFRA
+                      if r["status"] == "infra" else f"❌ Bản sửa code **chưa qua** bước `{step}` ({r['status']})")
               parts.append(f"{head} · {r['seconds']} giây · test giữ nguyên bản gốc\n\n" + log(r, "Log chạy thử (test gốc)"))
           if "B" in R:  # 25/11: fail-to-pass cho test đã sửa (SWE-bench / SWT-bench)
               b, c = R["B"], R.get("C")
-              if b["exit"] != 0:
-                  v = "❌ Test đã sửa **vẫn fail** trên code của PR (+ bản sửa)."
+              if b["status"] == "infra":
+                  v = INFRA
+              elif b["status"] != "pass":
+                  v = f"❌ Test đã sửa **vẫn fail** trên code của PR (+ bản sửa) ({b['status']})."
               elif c is None:
                   v = "⚠️ Test đã sửa pass trên code của PR; không lấy được code trước PR để kiểm tra fail-to-pass."
-              elif c["exit"] != 0:
+              elif c["status"] not in ("pass", "test_fail", "compile_fail"):
+                  v = (f"⚠️ Test đã sửa pass trên code của PR; trên code trước PR không chạy được ({c['status']}) "
+                       "nên chưa kết luận được fail-to-pass.")
+              elif c["status"] != "pass":
                   v = ("✅ Test đã sửa đạt **fail-to-pass**: fail trên code trước PR, pass trên code của PR → test "
                        "kiểm tra đúng hành vi mới. Người duyệt vẫn cần xác nhận hành vi mới là đúng ý.")
               else:
