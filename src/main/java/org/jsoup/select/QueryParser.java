@@ -635,7 +635,11 @@ public class QueryParser implements AutoCloseable {
 
     private int consumeIndex() {
         String index = consumeParens().trim();
-        Validate.isTrue(StringUtil.isNumeric(index), "Index must be numeric");
+        // isNumeric now accepts decimals; selector indexes must stay integer-only
+        boolean numeric = !index.isEmpty();
+        for (int i = 0; numeric && i < index.length(); i++)
+            numeric = StringUtil.isDigit(index.charAt(i));
+        Validate.isTrue(numeric, "Index must be numeric");
         return Integer.parseInt(index);
     }
 
